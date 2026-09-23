@@ -1,0 +1,22 @@
+diff --git a/client/sub_client.c b/client/sub_client.c
+index 4ff3bf9a..384ca8fa 100644
+--- a/client/sub_client.c
++++ b/client/sub_client.c
+@@ -46,6 +46,7 @@ int last_mid = 0;
+ static bool timed_out = false;
+ static int connack_result = 0;
+ bool connack_received = false;
++int total_count = 0;
+ 
+ #ifndef WIN32
+ static void my_signal_handler(int signum)
+@@ -95,7 +96,8 @@ static void my_message_callback(struct mosquitto *mosq, void *obj, const struct
+ 		mosquitto_publish(mosq, &last_mid, message->topic, 0, NULL, 1, true);
+ 	}
+ 
+-	print_message(&cfg, message, properties);
++	// print_message(&cfg, message, properties);
++	printf("%d ",total_count++);
+ 	if(ferror(stdout)){
+ 		mosquitto_disconnect_v5(mosq, 0, cfg.disconnect_props);
+ 	}

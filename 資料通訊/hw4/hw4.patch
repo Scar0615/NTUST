@@ -1,0 +1,356 @@
+diff --git a/client/pub_client.c b/client/pub_client.c
+index 7822e27f..836a9f35 100644
+--- a/client/pub_client.c
++++ b/client/pub_client.c
+@@ -37,6 +37,8 @@ Contributors:
+ #include "client_shared.h"
+ #include "pub_shared.h"
+ 
++#include <unistd.h>
++
+ /* Global variables for use in callbacks. See sub_client.c for an example of
+  * using a struct to hold variables for use in callbacks. */
+ static bool first_publish = true;
+@@ -112,14 +114,44 @@ void my_disconnect_callback(struct mosquitto *mosq, void *obj, int rc, const mos
+ 	}
+ }
+ 
++void taketimestamp(long *ts)
++{
++	struct timeval tv;
++	if (gettimeofday(&tv, NULL)) {
++		perror("gettimeofday");
++		exit(EXIT_FAILURE);
++	}
++	*ts = tv.tv_sec*1000000 + tv.tv_usec;
++	printf("%ld\n", *ts);
++}
++
++// original
++// int my_publish(struct mosquitto *mosq, int *mid, const char *topic, int payloadlen, void *payload, int qos, bool retain)
++// {
++// 	ready_for_repeat = false;
++// 	if(cfg.protocol_version == MQTT_PROTOCOL_V5 && cfg.have_topic_alias && first_publish == false){
++// 		return mosquitto_publish_v5(mosq, mid, NULL, payloadlen, payload, qos, retain, cfg.publish_props);
++// 	}else{
++// 		first_publish = false;
++// 		return mosquitto_publish_v5(mosq, mid, topic, payloadlen, payload, qos, retain, cfg.publish_props);
++// 	}
++// }
++
++// from pub_timestamped.c
+ int my_publish(struct mosquitto *mosq, int *mid, const char *topic, int payloadlen, void *payload, int qos, bool retain)
+ {
++	long timestamp;
++	taketimestamp(&timestamp);
++	char meta[payloadlen+8]; // in Linux, the fields of struct timeval are of type 'long' (8 bytes)
++	strcpy(meta, payload);
++	memcpy(&meta[payloadlen], &timestamp, 8);
+ 	ready_for_repeat = false;
+ 	if(cfg.protocol_version == MQTT_PROTOCOL_V5 && cfg.have_topic_alias && first_publish == false){
+ 		return mosquitto_publish_v5(mosq, mid, NULL, payloadlen, payload, qos, retain, cfg.publish_props);
+ 	}else{
+ 		first_publish = false;
+-		return mosquitto_publish_v5(mosq, mid, topic, payloadlen, payload, qos, retain, cfg.publish_props);
++		//return mosquitto_publish_v5(mosq, mid, topic, payloadlen, payload, qos, retain, cfg.publish_props);
++		return mosquitto_publish_v5(mosq, mid, topic, payloadlen+8, meta, qos, retain, cfg.publish_props);
+ 	}
+ }
+ 
+@@ -512,6 +544,31 @@ static void print_usage(void)
+ 	printf("\nSee https://mosquitto.org/ for more information.\n\n");
+ }
+ 
++// hw2: my_puback_callback
++void my_puback_callback(struct mosquitto *mosq, void *obj, int mid, int reason_code, const mosquitto_property *properties) {
++    printf("PUBACK received for message ID: %d, reason code: %d\n", mid, reason_code);
++
++	// Ignore unused parameters
++    (void)mosq;
++    (void)obj;
++    (void)properties;
++
++    // Call the timestamp function to print the time of PUBACK receipt
++    time_t now;
++    struct tm *ts;
++    char buf[80];
++
++    // Get the current time
++    time(&now);
++
++    // Format the time as "YYYY-MM-DD HH:MM:SS"
++    ts = localtime(&now);
++    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", ts);
++
++    // Print the timestamp
++    printf("PUBACK received at: %s\n", buf);
++}
++
+ int main(int argc, char *argv[])
+ {
+ 	struct mosquitto *mosq = NULL;
+@@ -583,6 +640,34 @@ int main(int argc, char *argv[])
+ 	mosquitto_disconnect_v5_callback_set(mosq, my_disconnect_callback);
+ 	mosquitto_publish_v5_callback_set(mosq, my_publish_callback);
+ 
++	// hw2: mosquitto_puback_v5_callback_set
++	mosquitto_puback_v5_callback_set(mosq, my_puback_callback);
++
++	// 連接到本地 broker
++	printf("Connecting to broker...\n");
++    rc = mosquitto_connect(mosq, "localhost", 1883, 60);
++    if (rc != MOSQ_ERR_SUCCESS) {
++        printf("Failed to connect: %s\n", mosquitto_strerror(rc));
++        return -1;
++    }
++
++	mosquitto_loop_start(mosq);
++
++    // 發送帶有 QoS 1 的消息
++	printf("Connected to broker, publishing message...\n");
++    rc = mosquitto_publish(mosq, NULL, "t1", strlen("Hello"), "Hello", 1, false);
++    if (rc != MOSQ_ERR_SUCCESS) {
++        printf("Failed to publish message: %s\n", mosquitto_strerror(rc));
++        return -1;
++    }
++
++    // 保持循環運行，等待 PUBACK
++	// printf("Message published, waiting for PUBACK...\n");
++    // if (rc != MOSQ_ERR_SUCCESS) {
++    //     printf("Event loop failed: %s\n", mosquitto_strerror(rc));
++    //     return -1;
++    // }
++
+ 	if(client_opts_set(mosq, &cfg)){
+ 		goto cleanup;
+ 	}
+@@ -598,6 +683,10 @@ int main(int argc, char *argv[])
+ 		free(cfg.message);
+ 		cfg.message = NULL;
+ 	}
++
++	sleep(5);
++	mosquitto_loop_stop(mosq, false);
++	
+ 	mosquitto_destroy(mosq);
+ 	mosquitto_lib_cleanup();
+ 	client_config_cleanup(&cfg);
+diff --git a/client/sub_client.c b/client/sub_client.c
+index 4ff3bf9a..a8e65a75 100644
+--- a/client/sub_client.c
++++ b/client/sub_client.c
+@@ -46,6 +46,7 @@ int last_mid = 0;
+ static bool timed_out = false;
+ static int connack_result = 0;
+ bool connack_received = false;
++int total_count = 0;
+ 
+ #ifndef WIN32
+ static void my_signal_handler(int signum)
+@@ -95,7 +96,8 @@ static void my_message_callback(struct mosquitto *mosq, void *obj, const struct
+ 		mosquitto_publish(mosq, &last_mid, message->topic, 0, NULL, 1, true);
+ 	}
+ 
+-	print_message(&cfg, message, properties);
++	// print_message(&cfg, message, properties);
++	printf("%d ",total_count++);
+ 	if(ferror(stdout)){
+ 		mosquitto_disconnect_v5(mosq, 0, cfg.disconnect_props);
+ 	}
+@@ -367,6 +369,7 @@ int main(int argc, char *argv[])
+ 	if(cfg.debug){
+ 		mosquitto_log_callback_set(g_mosq, my_log_callback);
+ 	}
++
+ 	mosquitto_subscribe_callback_set(g_mosq, my_subscribe_callback);
+ 	mosquitto_connect_v5_callback_set(g_mosq, my_connect_callback);
+ 	mosquitto_message_v5_callback_set(g_mosq, my_message_callback);
+diff --git a/client/sub_timestamped.c b/client/sub_timestamped.c
+index e362010e..429defcf 100644
+--- a/client/sub_timestamped.c
++++ b/client/sub_timestamped.c
+@@ -110,9 +110,9 @@ static void my_message_callback(struct mosquitto *mosq, void *obj, const struct
+ 	char *payload = (char*) message->payload;
+ 	long *ts = (long*) &payload[message->payloadlen-8];
+ 	printf("Timestamp received from publisher: %ld\n", *ts);
+-//	long now;
+-//	taketimestamp(&now);
+-//	printf("End-to-end latency: %ld us\n", now-*ts);
++	long now;
++	taketimestamp(&now);
++	printf("End-to-end latency: %ld us\n", now-*ts);
+ 	if(ferror(stdout)){
+ 		mosquitto_disconnect_v5(mosq, 0, cfg.disconnect_props);
+ 	}
+diff --git a/include/mosquitto.h b/include/mosquitto.h
+index 5633b407..090772be 100644
+--- a/include/mosquitto.h
++++ b/include/mosquitto.h
+@@ -2086,6 +2086,9 @@ libmosq_EXPORT void mosquitto_publish_callback_set(struct mosquitto *mosq, void
+  */
+ libmosq_EXPORT void mosquitto_publish_v5_callback_set(struct mosquitto *mosq, void (*on_publish)(struct mosquitto *, void *, int, int, const mosquitto_property *props));
+ 
++// hw2
++libmosq_EXPORT void mosquitto_puback_v5_callback_set(struct mosquitto *mosq, void (*on_puback)(struct mosquitto *, void *, int, int, const mosquitto_property *props));
++
+ /*
+  * Function: mosquitto_message_callback_set
+  *
+diff --git a/lib/callbacks.c b/lib/callbacks.c
+index 2e4f6bcc..f974fb75 100644
+--- a/lib/callbacks.c
++++ b/lib/callbacks.c
+@@ -71,6 +71,14 @@ void mosquitto_publish_v5_callback_set(struct mosquitto *mosq, void (*on_publish
+ 	pthread_mutex_unlock(&mosq->callback_mutex);
+ }
+ 
++// hw2
++void mosquitto_puback_v5_callback_set(struct mosquitto *mosq, void (*on_puback)(struct mosquitto *, void *, int, int, const mosquitto_property *props))
++{
++	pthread_mutex_lock(&mosq->callback_mutex);
++	mosq->on_puback = on_puback;
++	pthread_mutex_unlock(&mosq->callback_mutex);
++}
++
+ void mosquitto_message_callback_set(struct mosquitto *mosq, void (*on_message)(struct mosquitto *, void *, const struct mosquitto_message *))
+ {
+ 	pthread_mutex_lock(&mosq->callback_mutex);
+diff --git a/lib/linker.version b/lib/linker.version
+index a846505f..ea537bda 100644
+--- a/lib/linker.version
++++ b/lib/linker.version
+@@ -120,6 +120,7 @@ MOSQ_1.6 {
+ 		mosquitto_property_read_varint;
+ 		mosquitto_publish_v5;
+ 		mosquitto_publish_v5_callback_set;
++		mosquitto_puback_v5_callback_set;
+ 		mosquitto_reason_string;
+ 		mosquitto_string_option;
+ 		mosquitto_string_to_command;
+diff --git a/lib/mosquitto_internal.h b/lib/mosquitto_internal.h
+index ac71ffbf..342dcd8a 100644
+--- a/lib/mosquitto_internal.h
++++ b/lib/mosquitto_internal.h
+@@ -324,6 +324,8 @@ struct mosquitto {
+ 	void (*on_disconnect_v5)(struct mosquitto *, void *userdata, int rc, const mosquitto_property *props);
+ 	void (*on_publish)(struct mosquitto *, void *userdata, int mid);
+ 	void (*on_publish_v5)(struct mosquitto *, void *userdata, int mid, int reason_code, const mosquitto_property *props);
++	void (*on_puback)(struct mosquitto *, void *userdata, int mid);
++	void (*on_puback_v5)(struct mosquitto *, void *userdata, int mid, int reason_code, const mosquitto_property *props);
+ 	void (*on_message)(struct mosquitto *, void *userdata, const struct mosquitto_message *message);
+ 	void (*on_message_v5)(struct mosquitto *, void *userdata, const struct mosquitto_message *message, const mosquitto_property *props);
+ 	void (*on_subscribe)(struct mosquitto *, void *userdata, int mid, int qos_count, const int *granted_qos);
+diff --git a/source-gen.sh b/source-gen.sh
+index 24d16627..21f56364 100644
+--- a/source-gen.sh
++++ b/source-gen.sh
+@@ -8,6 +8,6 @@
+ 
+ # To learn more, see https://cscope.sourceforge.net/large_projects.html 
+ 
+-MOS=/home/cw/courses/csc0056/mosquitto
++MOS=/home/eric/mosquitto
+ cd /
+ find $MOS/include $MOS/src $MOS/lib $MOS/deps $MOS/client -name '*.[ch]' -print > $HOME/cscope/cscope.files
+diff --git a/src/mosquitto.c b/src/mosquitto.c
+index 431254d8..46ece95c 100644
+--- a/src/mosquitto.c
++++ b/src/mosquitto.c
+@@ -82,6 +82,19 @@ int deny_severity = LOG_INFO;
+  * Note that setting config->user to "root" does not produce an error, but it
+  * strongly discouraged.
+  */
++
++void taketimestamp(long *ts)
++{
++	struct timeval tv;
++	if (gettimeofday(&tv, NULL)) {
++		perror("gettimeofday");
++		exit(EXIT_FAILURE);
++	}
++	*ts = tv.tv_sec*1000000 + tv.tv_usec;
++	printf("%ld\n", *ts);
++}
++
++// 降低程式的權限等級
+ int drop_privileges(struct mosquitto__config *config)
+ {
+ #if !defined(__CYGWIN__) && !defined(WIN32)
+@@ -139,6 +152,7 @@ int drop_privileges(struct mosquitto__config *config)
+ 	return MOSQ_ERR_SUCCESS;
+ }
+ 
++// 將 Mosquitto 進程轉為背景守護進程
+ static void mosquitto__daemonise(void)
+ {
+ #ifndef WIN32
+@@ -177,7 +191,7 @@ static void mosquitto__daemonise(void)
+ #endif
+ }
+ 
+-
++// 設定預設監聽器參數
+ void listener__set_defaults(struct mosquitto__listener *listener)
+ {
+ 	listener->security_options.allow_anonymous = -1;
+@@ -188,7 +202,7 @@ void listener__set_defaults(struct mosquitto__listener *listener)
+ 	listener->max_topic_alias = 10;
+ }
+ 
+-
++// 重新加載所有憑證（與 TLS/SSL 相關）
+ void listeners__reload_all_certificates(void)
+ {
+ #ifdef WITH_TLS
+@@ -209,7 +223,7 @@ void listeners__reload_all_certificates(void)
+ #endif
+ }
+ 
+-
++// 啟動單個 MQTT broker
+ static int listeners__start_single_mqtt(struct mosquitto__listener *listener)
+ {
+ 	int i;
+@@ -241,6 +255,7 @@ static int listeners__start_single_mqtt(struct mosquitto__listener *listener)
+ 
+ 
+ #ifdef WITH_WEBSOCKETS
++// 添加 WebSocket 支援
+ void listeners__add_websockets(struct lws_context *ws_context, mosq_sock_t fd)
+ {
+ 	int i;
+@@ -276,7 +291,7 @@ void listeners__add_websockets(struct lws_context *ws_context, mosq_sock_t fd)
+ 	listensock_index++;
+ }
+ #endif
+-
++// 添加local broker
+ static int listeners__add_local(const char *host, uint16_t port)
+ {
+ 	struct mosquitto__listener *listeners;
+@@ -298,6 +313,7 @@ static int listeners__add_local(const char *host, uint16_t port)
+ 	return MOSQ_ERR_SUCCESS;
+ }
+ 
++// 僅啟動local broker
+ static int listeners__start_local_only(void)
+ {
+ 	/* Attempt to open listeners bound to 127.0.0.1 and ::1 only */
+@@ -337,7 +353,7 @@ static int listeners__start_local_only(void)
+ 	}
+ }
+ 
+-
++// 啟動所有broker
+ static int listeners__start(void)
+ {
+ 	int i;
+@@ -381,7 +397,7 @@ static int listeners__start(void)
+ 	return MOSQ_ERR_SUCCESS;
+ }
+ 
+-
++// 停止所有broker
+ static void listeners__stop(void)
+ {
+ 	int i;
